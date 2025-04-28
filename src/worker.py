@@ -1,46 +1,66 @@
 # src/worker.py
 import asyncio
+
+# import math # No longer needed here
 from arq import create_pool
 from arq.connections import RedisSettings, ArqRedis
 from loguru import logger
 
 from src.config import settings
 
-# --- Import task functions from their specific modules ---
+# Import task functions
 from src.tasks.discovery import discover_initial_books, fetch_book_details
-# --- Import NEW task functions ---
 from src.tasks.processing import discover_book_sutras, fetch_sutras_for_book
+
+# Import Phase 3 tasks (placeholder for now)
+# from src.tasks.parsing import generate_work_heading_map, process_sutra_html
 
 # Import DB/HTTP client managers
 from src.db.mongo_client import connect_to_mongo, close_mongo_connection
 from src.utils.http_client import http_client
 from src.utils.proxy_provider import proxy_provider
 
+# NOTE: DO NOT import update_adaptive_state from utils here, tasks will import it.
 
-async def startup(ctx: dict) -> None:
+
+async def startup(ctx: dict) -> None:  # Removed type hint for ctx
     """Runs when the ARQ worker starts."""
     logger.info("ARQ Worker starting up...")
+    if settings is None:
+        logger.critical("Settings not loaded. Worker cannot initialize properly.")
+        return
+
     # Initialize database connection
     await connect_to_mongo()
     # Initialize HTTP client session
     if http_client:
-        await http_client._get_session() # Ensure session exists
+        await http_client._get_session()  # Ensure session exists
     else:
         logger.error("HTTP Client not available during worker startup.")
     # Initialize Proxy Provider and refresh list
-    if proxy_provider and settings and settings.proxy_api_token:
+    if proxy_provider and settings.proxy_api_token:
         logger.info("Refreshing proxy list on worker startup...")
         try:
             await proxy_provider.refresh()
         except Exception as e:
             logger.error(f"Failed proxy refresh during worker startup: {e}")
-    # Create Redis pool for worker internal use (e.g., passing to tasks via context)
-    # This pool is managed by ARQ's worker lifecycle.
+
+    # --- Initialize Adaptive Scraping State ---
+    ctx["adaptive_state"] = {
+        "current_concurrency": settings.initial_concurrency,
+        "current_timeout_seconds": settings.initial_timeout_seconds,
+    }
+    logger.info(
+        f"Initialized adaptive state: Concurrency={ctx['adaptive_state']['current_concurrency']}, Timeout={ctx['adaptive_state']['current_timeout_seconds']:.1f}s"
+    )
+    # -----------------------------------------
+
+    # Create Redis pool for worker internal use
     ctx["redis"] = await create_pool(WorkerSettings.redis_settings)
     logger.info("ARQ Worker startup complete. Ready for tasks.")
 
 
-async def shutdown(ctx: dict) -> None:
+async def shutdown(ctx: dict) -> None:  # Removed type hint for ctx
     """Runs when the ARQ worker shuts down."""
     logger.info("ARQ Worker shutting down...")
     # Close worker's internal Redis pool
@@ -58,31 +78,26 @@ async def shutdown(ctx: dict) -> None:
     logger.info("ARQ Worker shutdown complete.")
 
 
+# --- Adaptive State Update Function ---
+# MOVED TO src/utils/adaptive_logic.py TO AVOID CIRCULAR IMPORT
+
+
 class WorkerSettings:
     """ARQ worker settings."""
 
-    # --- List ALL task functions the worker can execute ---
     functions = [
-        # Discovery tasks
+        # Phase 1
         discover_initial_books,
         fetch_book_details,
-        # Processing tasks (NEW)
+        # Phase 2
         discover_book_sutras,
         fetch_sutras_for_book,
+        # Phase 3 (Add later)
+        # generate_work_heading_map,
+        # process_sutra_html,
     ]
 
-    # Redis connection settings from main config
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
-
-    # Startup and shutdown hooks for the worker process
     on_startup = startup
     on_shutdown = shutdown
-
-    # Max attempts for a job (1 means no automatic retries by ARQ)
     max_tries = 1
-
-    # Optional: Set a global timeout for jobs if needed
-    # job_timeout = 600 # e.g., 10 minutes
-
-    # Keep jobs in Redis for a certain duration after completion/failure
-    # keep_result_seconds = 3600 # e.g., 1 hour

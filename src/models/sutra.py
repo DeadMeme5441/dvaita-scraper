@@ -21,7 +21,7 @@ class SutraBase(BaseModel):
     # Foreign key linking back to the Book
     book_id: int = Field(..., description="The book_id this sutra belongs to.")
     # The specific page URL where this sutra_id was found/listed
-    source_page_url: HttpUrl = Field(
+    source_page_url: str = Field(
         ..., description="The URL of the page listing this sutra_id."
     )
     # Raw HTML content fetched for this specific sutra_id

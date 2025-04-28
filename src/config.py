@@ -3,7 +3,7 @@ import os
 from typing import List, Optional, Union
 from typing_extensions import Annotated
 
-from pydantic import Field, field_validator, AnyHttpUrl, ValidationInfo
+from pydantic import Field, field_validator, AnyHttpUrl, ValidationInfo, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
 from loguru import logger
 
@@ -62,22 +62,50 @@ class Settings(BaseSettings):
     proxy_endpoint_mode: str = Field(default="direct", description="Webshare endpoint mode")
     proxy_search: List[str] = Field(default=["-"], description="Webshare search filters")
 
+    # --- Phase 2: Adaptive Scraping Settings ---
 
-    # --- Scraping Task Concurrency Settings ---
-    sutra_discovery_concurrency: int = Field(
-        default=5, gt=0,
-        description="Max concurrent requests for fetching page tree views (sutra discovery)."
+    # Initial values
+    initial_concurrency: int = Field(
+        default=20, gt=0, description="Initial concurrency level for scraping tasks."
     )
-    content_fetch_concurrency: int = Field(
-        default=10, gt=0,
-        description="Max concurrent requests for fetching sutra content (load-data)."
+    initial_timeout_seconds: float = Field(
+        default=300.0, gt=0, description="Initial request timeout in seconds."
     )
 
-    # --- NEW: Request Timeout Setting ---
-    scraper_request_timeout_seconds: int = Field(
-        default=300, # Default to 5 minutes
-        gt=0,
-        description="Timeout in seconds for individual HTTP requests during scraping."
+    # Concurrency bounds and adjustment
+    min_concurrency: int = Field(
+        default=5, gt=0, description="Minimum allowed concurrency level."
+    )
+    max_concurrency: int = Field(
+        default=50, gt=0, description="Maximum allowed concurrency level."
+    )
+    concurrency_error_threshold: int = Field(
+        default=3, ge=0, description="Number of errors (5xx/timeout) in a batch to trigger concurrency reduction."
+    )
+    concurrency_reduction_factor: float = Field(
+        default=0.9, gt=0, lt=1, description="Factor to multiply concurrency by when reducing (e.g., 0.9 reduces by 10%)."
+    )
+    concurrency_increase_step: int = Field(
+        default=1, gt=0, description="Amount to increase concurrency by if a batch has zero errors."
+    )
+
+    # Timeout bounds and adjustment
+    min_timeout_seconds: float = Field(
+        default=60.0, gt=0, description="Minimum allowed request timeout."
+    )
+    max_timeout_seconds: float = Field(
+        default=600.0, gt=0, description="Maximum allowed request timeout."
+    )
+    timeout_factor: float = Field(
+        default=1.5, gt=1.0, description="Factor to multiply average successful request time by to set new timeout."
+    )
+    timeout_fallback_seconds: float = Field(
+        default=300.0, gt=0, description="Timeout to use if no successful requests were made in a batch."
+    )
+
+    # Progress update frequency
+    progress_update_interval: int = Field(
+        default=25, gt=0, description="Update progress in DB every N items processed (pages or sutras)."
     )
 
 
@@ -94,6 +122,20 @@ class Settings(BaseSettings):
         logger.warning(f"Unexpected type '{type(v)}' for proxy list field. Using default: {default_value}")
         return default_value
 
+    @model_validator(mode='after')
+    def check_adaptive_bounds(self) -> 'Settings':
+        if self.min_concurrency >= self.max_concurrency:
+            raise ValueError("min_concurrency must be less than max_concurrency")
+        if self.initial_concurrency < self.min_concurrency or self.initial_concurrency > self.max_concurrency:
+            raise ValueError("initial_concurrency must be between min_concurrency and max_concurrency")
+        if self.min_timeout_seconds >= self.max_timeout_seconds:
+             raise ValueError("min_timeout_seconds must be less than max_timeout_seconds")
+        if self.initial_timeout_seconds < self.min_timeout_seconds or self.initial_timeout_seconds > self.max_timeout_seconds:
+             raise ValueError("initial_timeout_seconds must be between min_timeout_seconds and max_timeout_seconds")
+        if self.timeout_fallback_seconds < self.min_timeout_seconds or self.timeout_fallback_seconds > self.max_timeout_seconds:
+             raise ValueError("timeout_fallback_seconds must be between min_timeout_seconds and max_timeout_seconds")
+        return self
+
     model_config = SettingsConfigDict(
         env_file=ENV_FILE if os.path.exists(ENV_FILE) else None,
         env_file_encoding="utf-8",
@@ -108,9 +150,8 @@ try:
     logger.info(f"MongoDB URI Host (example): {settings.mongo_uri.split('@')[-1].split('/')[0]}")
     logger.info(f"Redis URL Host (example): {settings.redis_url.split('@')[-1].split('/')[0]}")
     logger.info(f"Log format set to JSON: {settings.log_format_json}")
-    logger.info(f"Sutra Discovery Concurrency: {settings.sutra_discovery_concurrency}")
-    logger.info(f"Content Fetch Concurrency: {settings.content_fetch_concurrency}")
-    logger.info(f"Scraper Request Timeout: {settings.scraper_request_timeout_seconds}s") # Log new setting
+    logger.info(f"Initial Concurrency: {settings.initial_concurrency}, Timeout: {settings.initial_timeout_seconds}s")
+    logger.info(f"Concurrency Range: [{settings.min_concurrency}-{settings.max_concurrency}], Timeout Range: [{settings.min_timeout_seconds}-{settings.max_timeout_seconds}]s")
 except Exception as e:
     logger.critical(f"Failed to load application settings: {e}")
     settings = None

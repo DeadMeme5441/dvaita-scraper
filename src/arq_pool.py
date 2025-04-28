@@ -5,7 +5,7 @@ from loguru import logger
 from arq import create_pool
 from arq.connections import ArqRedis
 
-# Import worker settings to get Redis config
+# --- Ensure this imports from the correct worker settings file ---
 from src.worker import WorkerSettings
 
 # Global variable to hold the pool instance within this module
@@ -38,6 +38,4 @@ async def close_arq_pool() -> None:
 
 def get_arq_pool_instance() -> Optional[ArqRedis]:
     """ Returns the initialized ARQ Redis pool instance. """
-    # This provides access without needing Depends in places outside routes if necessary
-    # Routes should use the dependency injector pattern.
     return arq_redis_pool

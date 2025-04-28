@@ -26,7 +26,6 @@ class BookBase(BaseModel):
     source_url: HttpUrl = Field(
         ..., description="The primary URL linking to this book."
     )
-    # Use string for page_urls to be more robust against invalid URLs from source
     page_urls: List[str] = Field(
         default_factory=list, description="List of discovered page URLs (as strings)."
     )
@@ -34,35 +33,45 @@ class BookBase(BaseModel):
         default=None, description="Raw HTML of the sidebar navigation."
     )
 
-    # Status fields remain optional in the base for flexibility when reading
+    # Phase 1 Statuses
     discovery_status: Optional[str] = Field(
         default="pending", description="Status of initial book link discovery."
     )
     sidebar_status: Optional[str] = Field(
         default="pending", description="Status of sidebar/page list fetching."
     )
-    # Sutra statuses are explicitly marked pending as they are not handled in Phase 1
+
+    # Phase 2 Statuses & Progress
     sutra_discovery_status: Optional[str] = Field(
         default="pending", description="Status of sutra discovery (Phase 2)."
     )
     content_fetch_status: Optional[str] = Field(
         default="pending", description="Status of content fetching (Phase 2)."
     )
-    # Progress and counts related to Phase 2
     sutra_discovery_progress: Optional[float] = Field(
-        default=None, description="Discovery progress % (Phase 2)."
+        default=None,
+        ge=0.0,
+        le=100.0,
+        description="Sutra discovery progress % (Phase 2).",
     )
     content_fetch_progress: Optional[float] = Field(
-        default=None, description="Content fetch progress % (Phase 2)."
+        default=None,
+        ge=0.0,
+        le=100.0,
+        description="Content fetch progress % (Phase 2).",
     )
     total_sutras_discovered: Optional[int] = Field(
-        default=None, description="Count of unique sutras found (Phase 2)."
+        default=None, ge=0, description="Count of unique sutras found (Phase 2)."
     )
     sutras_fetched_count: Optional[int] = Field(
-        default=None, description="Count of sutras successfully fetched (Phase 2)."
+        default=None,
+        ge=0,
+        description="Count of sutras successfully fetched (Phase 2).",
     )
     sutras_failed_count: Optional[int] = Field(
-        default=None, description="Count of sutras that failed fetching (Phase 2)."
+        default=None,
+        ge=0,
+        description="Count of sutras that failed fetching (Phase 2).",
     )
 
     model_config = {
@@ -76,27 +85,23 @@ class BookCreate(BookBase):
     Ensures book_id is present and sets statuses relevant to Phase 1 completion.
     """
 
-    # Add book_id here, as it's known when creating/upserting based on scraped data
     book_id: int = Field(
         ..., description="Integer ID used by dvaitavedanta.in for this book."
     )
 
-    # --- Phase 1 Statuses ---
-    # Set statuses to reflect completion of book detail fetching
-    discovery_status: str = "complete"  # Initial link discovery is done
+    # Phase 1 Statuses
+    discovery_status: str = "complete"
     sidebar_status: str  # Must be provided ('complete', 'parse_failed', 'fetch_failed')
 
-    # --- Phase 2 Statuses ---
-    # Explicitly set Phase 2 statuses to pending
+    # Phase 2 Statuses & Progress Initialization
     sutra_discovery_status: str = "pending"
     content_fetch_status: str = "pending"
-    sutra_discovery_progress: Optional[float] = 0.0  # Reset progress
-    content_fetch_progress: Optional[float] = 0.0  # Reset progress
-    total_sutras_discovered: Optional[int] = 0  # Reset counts
-    sutras_fetched_count: Optional[int] = 0  # Reset counts
-    sutras_failed_count: Optional[int] = 0  # Reset counts
+    sutra_discovery_progress: float = 0.0  # Initialize progress
+    content_fetch_progress: float = 0.0  # Initialize progress
+    total_sutras_discovered: int = 0  # Initialize counts
+    sutras_fetched_count: int = 0
+    sutras_failed_count: int = 0
 
-    # Use string list for page URLs
     page_urls: List[str] = Field(
         default_factory=list, description="List of discovered page URLs (as strings)."
     )
@@ -114,7 +119,7 @@ class BookUpdate(BaseModel):
     section: Optional[str] = None
     order_in_section: Optional[int] = None
     source_url: Optional[HttpUrl] = None
-    page_urls: Optional[List[str]] = None  # Use string list
+    page_urls: Optional[List[str]] = None
     sidebar_html: Optional[str] = None
     # Phase 1 Statuses
     discovery_status: Optional[str] = None
@@ -137,7 +142,6 @@ class BookInDB(BookBase, BaseModelWithTimestamps):
     Uses 'id' aliased to '_id' as the primary identifier.
     """
 
-    # Define 'id' field aliased to MongoDB's '_id'
     id: int = Field(
         ...,
         description="MongoDB document ID (same as the book's integer ID).",
@@ -145,6 +149,6 @@ class BookInDB(BookBase, BaseModelWithTimestamps):
     )
 
     model_config = {
-        "populate_by_name": True,  # Allows mapping '_id' to 'id'
+        "populate_by_name": True,
         "arbitrary_types_allowed": True,
     }

@@ -1,24 +1,24 @@
 # src/routes/scraper_routes.py
 
+import asyncio # Import asyncio for sleep
 from fastapi import APIRouter, HTTPException, Query, Depends, BackgroundTasks
 from loguru import logger
 from typing import List, Optional
 
-import asyncio
-from src.arq_pool import (
-    get_arq_pool_instance,
-)  # Use the pool managed by FastAPI lifespan
+from src.arq_pool import get_arq_pool_instance
 from arq.connections import ArqRedis
 from src.db.mongo_client import get_mongo_db
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-# --- Use correct NEW task function names (as strings) ---
-INITIAL_DISCOVERY_TASK_NAME = "discover_initial_books"  # Task defined in discovery.py
-# Renamed for clarity: This is the entry point for processing a book after details are fetched
-PROCESS_ENTRY_TASK_NAME = "discover_book_sutras"  # Task defined in processing.py
+# --- Task Names ---
+INITIAL_DISCOVERY_TASK_NAME = "discover_initial_books" # Phase 1
+FETCH_BOOK_DETAILS_TASK_NAME = "fetch_book_details" # Phase 1
+# Phase 2 Entry Point Task
+DISCOVER_SUTRAS_TASK_NAME = "discover_book_sutras"
+# Phase 2 Content Fetch Task (usually triggered internally by DISCOVER_SUTRAS_TASK_NAME)
+FETCH_SUTRAS_TASK_NAME = "fetch_sutras_for_book"
 
 router = APIRouter()
-
 
 # --- Dependency for ARQ Pool ---
 async def get_arq_pool() -> ArqRedis:
@@ -26,165 +26,115 @@ async def get_arq_pool() -> ArqRedis:
     pool = get_arq_pool_instance()
     if pool is None:
         logger.error("ARQ Pool dependency requested but pool is not initialized.")
-        raise HTTPException(
-            status_code=503, detail="Background task queue is unavailable."
-        )
+        raise HTTPException(status_code=503, detail="Background task queue is unavailable.")
     return pool
 
-
-# --- Helper Function to Get Book IDs ---
-async def _get_book_ids_for_processing(
-    db: AsyncIOMotorDatabase, status_filter: Optional[str]
-) -> List[int]:
+# --- Helper Function to Get Book IDs for Phase 2 ---
+async def _get_book_ids_for_phase2(db: AsyncIOMotorDatabase, work_id: Optional[int] = None) -> List[int]:
     """
-    Retrieves book IDs from MongoDB based on a status filter.
-    Focuses on finding books needing the *start* of the processing pipeline.
+    Retrieves book IDs ready for Phase 2 processing (sutra discovery).
+    Looks for books where Phase 1 (sidebar fetch) succeeded but Phase 2 hasn't started.
     """
     try:
         books_coll = db["books"]
-        query = {}
-        # Default: Find books where details are fetched but sutra discovery hasn't started or failed previously
-        if status_filter == "pending_processing" or not status_filter:
-            query = {
-                "sidebar_status": {
-                    "$ne": "fetch_failed"
-                },  # Ensure details were likely fetched
-                "sutra_discovery_status": {
-                    "$in": ["pending", "fetch_errors", "db_error", "enqueue_failed"]
-                },  # Statuses indicating discovery needs (re)trying
-            }
-        elif (
-            status_filter == "all"
-        ):  # Process all books regardless of status (use with caution)
-            query = {}
-        # Add more specific filters if needed
-        # elif status_filter == "failed_discovery": query = {"sutra_discovery_status": {"$in": ["fetch_errors", "db_error"]}}
-        # elif status_filter == "failed_content": query = {"content_fetch_status": {"$in": ["failed", "partial_failure", "db_error", "enqueue_failed"]}} # Requires enqueueing fetch_sutras_for_book directly
+        query = {
+            "sidebar_status": {"$in": ["complete", "parse_failed"]}, # Sidebar fetch attempted (even if parse failed, might have source URL)
+            "sutra_discovery_status": {"$in": ["pending", "fetch_errors", "db_error", "enqueue_failed", "error"]} # Needs (re)trying
+        }
+        if work_id is not None:
+            query["_id"] = work_id # Filter by specific work_id if provided
 
-        cursor = books_coll.find(query, {"_id": 1})  # Project only the ID
+        cursor = books_coll.find(query, {"_id": 1}) # Project only the ID
         book_ids = [doc["_id"] async for doc in cursor if doc.get("_id")]
-        logger.info(
-            f"Found {len(book_ids)} book IDs matching filter '{status_filter}'."
-        )
+        count_str = f"book {work_id}" if work_id is not None else f"{len(book_ids)} books"
+        logger.info(f"Found {count_str} ready for Phase 2 processing.")
         return book_ids
     except Exception as e:
-        logger.error(f"Failed to get book IDs with filter '{status_filter}': {e}")
+        logger.error(f"Failed to get book IDs for Phase 2 (work_id={work_id}): {e}")
         return []
-
 
 # --- API Endpoints ---
 
-
-@router.post("/discover", status_code=202, summary="Trigger Initial Book Discovery")
-async def trigger_book_discovery(redis: ArqRedis = Depends(get_arq_pool)) -> dict:
-    """
-    Enqueues the task to discover initial book information from the website's homepage.
-    This is the starting point for populating the 'books' collection.
-    """
+# Phase 1 Endpoints (Unchanged)
+@router.post("/discover", status_code=202, summary="Trigger Initial Book Discovery (Phase 1)")
+async def trigger_book_discovery(
+    redis: ArqRedis = Depends(get_arq_pool)
+) -> dict:
+    """Enqueues the task to discover initial book information from the homepage."""
     logger.info("API: Received request to trigger initial book discovery.")
     try:
-        # Enqueue the first discovery task by its name
         job = await redis.enqueue_job(INITIAL_DISCOVERY_TASK_NAME)
-        logger.info(f"API: Enqueued initial book discovery task. Job ID: {job.job_id}")
-        return {
-            "message": "Initial book discovery task enqueued.",
-            "job_id": job.job_id,
-        }
+        logger.info(f"API: Enqueued '{INITIAL_DISCOVERY_TASK_NAME}'. Job ID: {job.job_id}")
+        return {"message": "Initial book discovery task enqueued.", "job_id": job.job_id}
     except Exception as e:
         logger.error(f"API: Failed to enqueue discovery task: {e}")
-        raise HTTPException(
-            status_code=500, detail="Failed to enqueue background task."
-        )
+        raise HTTPException(status_code=500, detail="Failed to enqueue background task.")
 
+# Phase 2 Endpoints
 
-@router.post(
-    "/process/book/{book_id}",
-    status_code=202,
-    summary="Trigger Processing for Single Book",
-)
-async def trigger_process_single_book(
-    book_id: int, redis: ArqRedis = Depends(get_arq_pool)
-) -> dict:
-    """
-    Enqueues the task to start processing a specific book
-    (discover its sutras, then fetch content).
-    Assumes book details have already been fetched by `/discover`.
-    """
-    logger.info(f"API: Received request to process book with ID: {book_id}")
-    try:
-        # Enqueue the *new* entry point processing task
-        job = await redis.enqueue_job(PROCESS_ENTRY_TASK_NAME, book_id=book_id)
-        logger.info(
-            f"API: Enqueued '{PROCESS_ENTRY_TASK_NAME}' task for book {book_id}. Job ID: {job.job_id}"
-        )
-        return {
-            "message": f"Book processing task ({PROCESS_ENTRY_TASK_NAME}) for book_id {book_id} enqueued.",
-            "job_id": job.job_id,
-        }
-    except Exception as e:
-        logger.error(f"API: Failed to enqueue processing task for book {book_id}: {e}")
-        raise HTTPException(
-            status_code=500, detail="Failed to enqueue background task."
-        )
-
-
-@router.post(
-    "/process/all", status_code=202, summary="Trigger Processing for Multiple Books"
-)
-async def trigger_process_all_books(
-    background_tasks: BackgroundTasks,  # Use BackgroundTasks for DB query
+@router.post("/process/phase2/book/{book_id}", status_code=202, summary="Trigger Sutra Discovery for Single Book (Phase 2)")
+async def trigger_phase2_single_book(
+    book_id: int,
     redis: ArqRedis = Depends(get_arq_pool),
-    db: AsyncIOMotorDatabase = Depends(get_mongo_db),  # Dependency for DB access
-    status_filter: Optional[str] = Query(
-        "pending_processing",
-        description="Filter books to process (e.g., 'pending_processing', 'all')",
-    ),
+    db: AsyncIOMotorDatabase = Depends(get_mongo_db) # Check status before enqueueing
 ) -> dict:
     """
-    Finds books matching the filter criteria in the database and enqueues
-    the processing task (`discover_book_sutras`) for each.
-    The database query runs in the background to avoid blocking the API response.
+    Checks if a specific book is ready and enqueues the task to discover its sutras (Phase 2 start).
     """
-    logger.info(
-        f"API: Received request to process all books (filter: {status_filter})."
-    )
+    logger.info(f"API: Received request to start Phase 2 for book ID: {book_id}")
+    # Check if the book is actually ready for Phase 2
+    ready_ids = await _get_book_ids_for_phase2(db, work_id=book_id)
+    if book_id not in ready_ids:
+         logger.warning(f"API: Book {book_id} not found or not ready for Phase 2 processing.")
+         raise HTTPException(status_code=404, detail=f"Book {book_id} not found or not ready for Phase 2 (check sidebar_status and sutra_discovery_status).")
 
-    async def enqueue_processing_tasks():
-        book_ids = await _get_book_ids_for_processing(db, status_filter=status_filter)
+    try:
+        # Enqueue the Phase 2 entry point task
+        job = await redis.enqueue_job(DISCOVER_SUTRAS_TASK_NAME, book_id=book_id)
+        logger.info(f"API: Enqueued '{DISCOVER_SUTRAS_TASK_NAME}' task for book {book_id}. Job ID: {job.job_id}")
+        return {"message": f"Phase 2 task ({DISCOVER_SUTRAS_TASK_NAME}) for book_id {book_id} enqueued.", "job_id": job.job_id}
+    except Exception as e:
+        logger.error(f"API: Failed to enqueue Phase 2 task for book {book_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to enqueue background task.")
+
+
+@router.post("/process/phase2/all", status_code=202, summary="Trigger Sutra Discovery for All Ready Books (Phase 2)")
+async def trigger_phase2_all_books(
+    background_tasks: BackgroundTasks, # Use BackgroundTasks for DB query/loop
+    redis: ArqRedis = Depends(get_arq_pool),
+    db: AsyncIOMotorDatabase = Depends(get_mongo_db) # Dependency for DB access
+) -> dict:
+    """
+    Finds all books ready for Phase 2 (sutra discovery) and enqueues the
+    `discover_book_sutras` task for each in the background.
+    """
+    logger.info(f"API: Received request to start Phase 2 for all ready books.")
+
+    async def enqueue_phase2_tasks():
+        book_ids = await _get_book_ids_for_phase2(db)
         if not book_ids:
-            logger.info(
-                f"API BG: No books found matching filter '{status_filter}' for bulk processing."
-            )
-            return  # No tasks to enqueue
+            logger.info(f"API BG: No books found ready for Phase 2 processing.")
+            return
 
         enqueued_count = 0
         enqueue_errors = 0
-        job_ids = []  # Optional: Collect job IDs if needed
+        job_ids = []
 
-        logger.info(
-            f"API BG: Enqueueing '{PROCESS_ENTRY_TASK_NAME}' for {len(book_ids)} books..."
-        )
+        logger.info(f"API BG: Enqueueing '{DISCOVER_SUTRAS_TASK_NAME}' for {len(book_ids)} books...")
         for book_id in book_ids:
             try:
-                job = await redis.enqueue_job(PROCESS_ENTRY_TASK_NAME, book_id=book_id)
-                job_ids.append(job.job_id)  # Store job ID
+                job = await redis.enqueue_job(DISCOVER_SUTRAS_TASK_NAME, book_id=book_id)
+                job_ids.append(job.job_id)
                 enqueued_count += 1
             except Exception as e:
-                logger.error(f"API BG: Failed to enqueue task for book {book_id}: {e}")
+                logger.error(f"API BG: Failed to enqueue Phase 2 task for book {book_id}: {e}")
                 enqueue_errors += 1
-            # Add a small sleep to avoid overwhelming Redis/network if enqueueing thousands
-            if enqueued_count % 100 == 0:
-                await asyncio.sleep(0.1)
+            # Small sleep to avoid overwhelming Redis/network
+            if enqueued_count % 100 == 0: await asyncio.sleep(0.1)
 
-        logger.info(
-            f"API BG: Finished enqueueing. Success: {enqueued_count}, Errors: {enqueue_errors}."
-        )
+        logger.info(f"API BG: Finished Phase 2 enqueueing. Success: {enqueued_count}, Errors: {enqueue_errors}.")
 
-    # Add the enqueueing logic as a background task
-    background_tasks.add_task(enqueue_processing_tasks)
+    # Add the potentially long-running enqueueing logic as a background task
+    background_tasks.add_task(enqueue_phase2_tasks)
 
-    # Return immediate response to the client
-    return {
-        "message": f"Bulk processing task initiated for books matching filter '{status_filter}'. Check worker logs for progress.",
-        "tasks_being_enqueued_in_background": True,
-    }
+    return {"message": "Phase 2 processing task initiation started in background for all ready books. Check worker logs.", "tasks_being_enqueued_in_background": True}
