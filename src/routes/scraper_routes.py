@@ -68,16 +68,16 @@ async def _get_book_ids_for_phase3a(
             "content_fetch_status": {
                 "$in": ["complete", "no_content_found", "partial_failure"]
             },
-            "phase3_status": {
-                "$nin": [
-                    "preprocessing",
-                    "preprocessing_complete",
-                    "generating_markdown",
-                    "complete",
-                    "skipped_no_sutras",
-                    "skipped_no_preprocessed_sutras",
-                ]
-            },
+            # "phase3_status": {
+            #     "$nin": [
+            #         "preprocessing",
+            #         "preprocessing_complete",
+            #         "generating_markdown",
+            #         "complete",
+            #         "skipped_no_sutras",
+            #         "skipped_no_preprocessed_sutras",
+            #     ]
+            # },
         }
         if work_id is not None:
             query["_id"] = work_id
