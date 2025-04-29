@@ -35,14 +35,15 @@ PATH_RE = re.compile(r"/category-details/(?P<page_id>\d+)/(?P<work_id>\d+)")
 SUTRA_ID_SELECTOR = "p.explanation-text[id]"
 # Task names for enqueueing
 FETCH_SUTRAS_TASK_NAME = "fetch_sutras_for_book"
-# Placeholder for Phase 3 trigger
-PROCESS_SUTRAS_TASK_NAME = "process_sutra_html"  # Example name
-GENERATE_MAP_TASK_NAME = "generate_work_heading_map"  # Example name
+# Phase 3 task names (will be defined in parsing.py)
+# PROCESS_SUTRAS_TASK_NAME = "process_sutra_html"
+# GENERATE_MAP_TASK_NAME = "generate_work_heading_map"
 
 
 # --- Helper Functions ---
-
-
+# (_get_arq_redis_from_context, _get_adaptive_state, _parse_sutra_ids_from_html,
+#  _update_book_status, _fetch_and_parse_page_sutras,
+#  _fetch_and_update_sutra_content remain unchanged from previous version)
 def _get_arq_redis_from_context(ctx: dict) -> Optional[ArqRedis]:  # Use dict for ctx
     """Safely retrieves the ArqRedis instance from the worker context."""
     try:
@@ -97,24 +98,15 @@ async def _update_book_status(book_id: int, status_updates: Dict[str, Any]):
     try:
         mongo_db = get_mongo_db()
         books_coll = mongo_db[BOOKS_COLLECTION]
-        # Remove None values to avoid overwriting existing valid values with None
         updates_to_set = {k: v for k, v in status_updates.items() if v is not None}
         if not updates_to_set:
             logger.debug(f"No non-None status updates for book {book_id}.")
             return
 
-        # --- FIX: Combine all updates under a single $set operator ---
-        # Add the updated_at timestamp to the dictionary being set
         updates_to_set["updated_at"] = datetime.now()
 
         logger.debug(f"Updating status/progress for book {book_id}: {updates_to_set}")
-        await books_coll.update_one(
-            {"_id": book_id},
-            {
-                "$set": updates_to_set
-            },  # Single $set with all updates including timestamp
-        )
-        # -------------------------------------------------------------
+        await books_coll.update_one({"_id": book_id}, {"$set": updates_to_set})
     except Exception as e:
         logger.error(f"Failed to update status for book {book_id}: {e}")
 
@@ -147,7 +139,6 @@ async def _fetch_and_parse_page_sutras(
             base_url = str(settings.target_base_url).rstrip("/")
             tree_view_url = f"{base_url}/category-details/{page_id}/{book_id}/get-categories-tree-view"
 
-            # logger.debug(f"{log_prefix} Fetching sutra list from: {tree_view_url} (Timeout: {timeout:.1f}s)") # DEBUG
             status_code, page_html_bytes, duration, error = (
                 await http_client_instance.get(
                     tree_view_url,
@@ -163,7 +154,6 @@ async def _fetch_and_parse_page_sutras(
                     sutra_ids_found = _parse_sutra_ids_from_html(
                         page_html, tree_view_url
                     )
-                    # logger.debug(f"{log_prefix} Found {len(sutra_ids_found)} sutra IDs on page {page_id} ({tree_view_url})") # DEBUG
                 except (UnicodeDecodeError, Exception) as parse_error:
                     logger.error(
                         f"{log_prefix} Failed to decode/parse HTML from {tree_view_url}: {parse_error}"
@@ -182,7 +172,7 @@ async def _fetch_and_parse_page_sutras(
             if error is None:
                 error = e
             if duration == 0.0:
-                duration = timeout  # Approximate duration on error
+                duration = timeout
 
         return page_url, sutra_ids_found, status_code, duration, error
 
@@ -212,7 +202,6 @@ async def _fetch_and_update_sutra_content(
         load_data_url = f"{base_url}/load-data?book_id={book_id}&id={sutra_id}"
 
         try:
-            # logger.debug(f"{log_prefix} Fetching content from: {load_data_url} (Timeout: {timeout:.1f}s)") # DEBUG
             status_code, response_data, duration, error = (
                 await http_client_instance.get(
                     load_data_url,
@@ -226,8 +215,6 @@ async def _fetch_and_update_sutra_content(
                 raw_html = response_data.get("html")
                 tag_html = response_data.get("tag")
                 fetch_status = "complete" if raw_html is not None else "fetch_nodata"
-                # log_level = "SUCCESS" if fetch_status == "complete" else "WARNING" # DEBUG
-                # logger.log(log_level, f"{log_prefix} Content fetch status for sutra {sutra_id}: {fetch_status}") # DEBUG
             elif (
                 error is None
                 and status_code == 200
@@ -255,7 +242,6 @@ async def _fetch_and_update_sutra_content(
             if duration == 0.0:
                 duration = timeout
 
-        # Update DB regardless of fetch outcome
         try:
             filter_query = {"_id": {"book_id": book_id, "sutra_id": sutra_id}}
             update_doc = {
@@ -263,7 +249,7 @@ async def _fetch_and_update_sutra_content(
                     "fetch_status": fetch_status,
                     "raw_html": raw_html,
                     "tag_html": tag_html,
-                    "updated_at": datetime.now(),  # Use standard datetime.now()
+                    "updated_at": datetime.now(),
                 }
             }
             await sutras_coll.update_one(filter_query, update_doc)
@@ -286,7 +272,6 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
     log_prefix = f"[DiscoverSutras|Book {book_id}]"
     logger.info(f"{log_prefix} Task started.")
 
-    # --- Get Dependencies & Adaptive State ---
     if not settings or not http_client:
         return f"{log_prefix} Failed: Settings or HTTP client missing."
     adaptive_state = _get_adaptive_state(ctx)
@@ -301,12 +286,10 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
     except Exception as e:
         return f"{log_prefix} Failed: DB connection error: {e}"
 
-    # --- Fetch Book Details ---
     try:
         book_data = await books_coll.find_one({"_id": book_id})
         if not book_data:
             return f"{log_prefix} Failed: Book not found."
-        # logger.debug(f"{log_prefix} Book data keys: {list(book_data.keys())}") # DEBUG
         book = BookInDB.model_validate(book_data)
         page_urls = book.page_urls if book.page_urls else []
         if not page_urls:
@@ -321,13 +304,11 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
         if book.sutra_discovery_status == "complete":
             logger.info(f"{log_prefix} Sutra discovery already marked complete.")
             return f"{log_prefix} Completed: Discovery already done."
-
     except ValidationError as e:
         return f"{log_prefix} Failed: Invalid book data in DB: {e}"
     except Exception as e:
         return f"{log_prefix} Failed: Error fetching book details: {e}"
 
-    # --- Sutra Discovery Phase ---
     total_pages = len(page_urls)
     logger.info(f"{log_prefix} Starting sutra discovery across {total_pages} pages.")
     await _update_book_status(
@@ -357,13 +338,11 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
     all_discovered_sutras: Dict[int, SutraCreate] = {}
     batch_results_for_adaptation = []
     processed_page_count = 0
-
     gather_results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
 
     for i, result in enumerate(gather_results):
         processed_page_count += 1
         page_url_processed = page_urls[i]
-
         if isinstance(result, Exception):
             logger.error(
                 f"{log_prefix} Task-level exception for page {page_url_processed}: {result}"
@@ -372,7 +351,6 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
         elif isinstance(result, tuple) and len(result) == 5:
             _, sutra_ids_found, status, duration, error = result
             batch_results_for_adaptation.append((status, None, duration, error))
-
             if error is None and status == 200:
                 for sutra_id in sutra_ids_found:
                     if sutra_id not in all_discovered_sutras:
@@ -414,14 +392,10 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
     logger.info(
         f"{log_prefix} Discovery phase finished. Found {total_sutras_found} unique sutras."
     )
-
-    # --- Adapt Settings Based on Batch Results ---
     update_adaptive_state(ctx, batch_results_for_adaptation, log_prefix)
 
-    # --- Database Update and Enqueue Next Task ---
     final_discovery_status = "unknown"
     enqueue_next = False
-
     if total_sutras_found > 0:
         bulk_ops = []
         for sutra_id, sutra in all_discovered_sutras.items():
@@ -429,14 +403,13 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
             update_data = sutra.model_dump(exclude_unset=True, mode="json")
             now = datetime.now()
             update_doc = {
-                "$set": {"updated_at": now},  # Use $set for timestamp
+                "$set": {"updated_at": now},
                 "$setOnInsert": {**update_data, "created_at": now},
             }
             update_doc["$setOnInsert"].pop("_id", None)
             update_doc["$setOnInsert"].pop("id", None)
             op = UpdateOne(filter_query, update_doc, upsert=True)
             bulk_ops.append(op)
-
         if bulk_ops:
             logger.info(f"{log_prefix} Upserting {len(bulk_ops)} sutra placeholders...")
             try:
@@ -451,7 +424,6 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
                 final_discovery_status = "db_error"
         else:
             final_discovery_status = "error"
-
     else:
         fetch_errors = sum(
             1 for _, _, _, err in batch_results_for_adaptation if err is not None
@@ -465,7 +437,6 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
             logger.info(f"{log_prefix} No sutras were found for this book.")
             final_discovery_status = "no_sutras"
 
-    # Get last known progress before potentially overwriting with 100%
     current_book_prog = await books_coll.find_one(
         {"_id": book_id}, {"sutra_discovery_progress": 1}
     )
@@ -477,7 +448,6 @@ async def discover_book_sutras(ctx: dict, book_id: int) -> str:  # Use dict for 
     final_progress = (
         100.0 if final_discovery_status in ["complete", "no_sutras"] else last_progress
     )
-
     await _update_book_status(
         book_id,
         {
@@ -530,18 +500,17 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
     """
     ARQ Task (Phase 2): Fetches content for pending sutras of a book using
     adaptive concurrency and timeouts. Updates sutra docs and book status.
-    Triggers Phase 3 processing upon completion.
+    *** Does NOT trigger Phase 3 anymore. ***
     """
     log_prefix = f"[FetchContent|Book {book_id}]"
     logger.info(f"{log_prefix} Task started.")
 
-    # --- Get Dependencies & Adaptive State ---
     if not settings or not http_client:
         return f"{log_prefix} Failed: Settings or HTTP client missing."
     adaptive_state = _get_adaptive_state(ctx)
     if not adaptive_state:
         return f"{log_prefix} Failed: Adaptive state missing."
-    arq_redis = _get_arq_redis_from_context(ctx)
+    # arq_redis = _get_arq_redis_from_context(ctx) # No longer needed here
 
     try:
         mongo_db = get_mongo_db()
@@ -550,7 +519,6 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
     except Exception as e:
         return f"{log_prefix} Failed: DB connection error: {e}"
 
-    # --- Find Sutras to Fetch ---
     sutras_to_fetch_ids: List[int] = []
     try:
         fetch_needed_statuses = [
@@ -571,7 +539,6 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
             and isinstance(doc["_id"], dict)
             and "sutra_id" in doc["_id"]
         ]
-
         if not sutras_to_fetch_ids:
             logger.info(f"{log_prefix} No sutras found needing content fetch.")
             total_sutras_exist = await sutras_coll.count_documents({"book_id": book_id})
@@ -592,15 +559,15 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
                         "content_fetch_progress": 100.0,
                     },
                 )
-            if final_book_status == "complete":
-                await _trigger_phase3_processing(arq_redis, book_id, log_prefix)
+            # --- Phase 3 Trigger Removed ---
+            # if final_book_status == "complete":
+            #     await _trigger_phase3_processing(arq_redis, book_id, log_prefix)
+            # -----------------------------
             return f"{log_prefix} Completed: No pending sutras."
-
     except Exception as e:
         await _update_book_status(book_id, {"content_fetch_status": "db_error"})
         return f"{log_prefix} Failed: Error querying sutras: {e}"
 
-    # --- Content Fetching Phase ---
     num_to_fetch = len(sutras_to_fetch_ids)
     logger.info(f"{log_prefix} Starting content fetching for {num_to_fetch} sutras.")
     await _update_book_status(
@@ -636,13 +603,11 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
         "task_exception": 0,
     }
     processed_content_count = 0
-
     gather_results = await asyncio.gather(*content_tasks, return_exceptions=True)
 
     for i, result in enumerate(gather_results):
         processed_content_count += 1
         sutra_id_processed = sutras_to_fetch_ids[i]
-
         if isinstance(result, Exception):
             logger.error(
                 f"{log_prefix} Task-level exception for sutra {sutra_id_processed}: {result}"
@@ -653,7 +618,6 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
         elif isinstance(result, tuple) and len(result) == 5:
             _, final_status, status_code, duration, error = result
             batch_results_for_adaptation.append((status_code, None, duration, error))
-
             if final_status in content_fetch_outcomes:
                 content_fetch_outcomes[final_status] += 1
             else:
@@ -688,11 +652,8 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
     logger.info(
         f"{log_prefix} Content fetching phase finished. Outcomes: {content_fetch_outcomes}"
     )
-
-    # --- Adapt Settings Based on Batch Results ---
     update_adaptive_state(ctx, batch_results_for_adaptation, log_prefix)
 
-    # --- Determine Final Book Status ---
     final_content_status = "unknown"
     total_succeeded = content_fetch_outcomes["complete"]
     total_failed = (
@@ -715,14 +676,10 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
     elif total_succeeded == 0 and total_failed == 0 and total_nodata_badresp > 0:
         final_content_status = "no_content_found"
     elif num_to_fetch > 0:
-        logger.warning(
-            f"{log_prefix} Inconsistent final status calc. Outcomes: {content_fetch_outcomes}"
-        )
         final_content_status = "error"
     else:
         final_content_status = "skipped"
 
-    # --- Final Book Status Update & Trigger Phase 3 ---
     current_book_prog = await books_coll.find_one(
         {"_id": book_id}, {"content_fetch_progress": 1}
     )
@@ -736,7 +693,6 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
         if final_content_status in ["complete", "no_content_found", "skipped"]
         else last_progress
     )
-
     await _update_book_status(
         book_id,
         {
@@ -747,30 +703,15 @@ async def fetch_sutras_for_book(ctx: dict, book_id: int) -> str:  # Use dict for
         },
     )
 
-    if final_content_status in ["complete", "no_content_found"]:
-        await _trigger_phase3_processing(arq_redis, book_id, log_prefix)
+    # --- Phase 3 Trigger Removed ---
+    # if final_content_status in ["complete", "no_content_found"]:
+    #     await _trigger_phase3_processing(arq_redis, book_id, log_prefix)
+    # -----------------------------
+    logger.info(f"{log_prefix} Phase 2 finished. Final Status: {final_content_status}")
 
     return f"{log_prefix} Finished. Status: {final_content_status}. Success: {total_succeeded}, Fail: {total_failed}, NoData/BadResp: {total_nodata_badresp}"
 
 
-async def _trigger_phase3_processing(
-    arq_redis: Optional[ArqRedis], book_id: int, log_prefix: str
-):
-    """Helper to enqueue the first task of Phase 3."""
-    if not arq_redis:
-        logger.error(f"{log_prefix} Cannot trigger Phase 3: ARQ Redis unavailable.")
-        # Consider adding a 'phase3_status' field to the book model
-        # await _update_book_status(book_id, {"phase3_status": "enqueue_failed"})
-        return
-
-    try:
-        logger.info(
-            f"{log_prefix} Phase 2 complete. Phase 3 processing would be triggered for book {book_id}."
-        )
-        # Example: await arq_redis.enqueue_job(GENERATE_MAP_TASK_NAME, book_id=book_id)
-        # await _update_book_status(book_id, {"phase3_status": "pending"})
-    except Exception as e:
-        logger.error(
-            f"{log_prefix} Failed to enqueue Phase 3 task for book {book_id}: {e}"
-        )
-        # await _update_book_status(book_id, {"phase3_status": "enqueue_failed"})
+# --- Remove _trigger_phase3_processing helper ---
+# async def _trigger_phase3_processing(arq_redis: Optional[ArqRedis], book_id: int, log_prefix: str):
+#     ...
